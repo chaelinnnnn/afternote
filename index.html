@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AFTERNOTE — Field Generator (B) + Dot Alphabet</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #d2d0c8; }
+    .wrap { height: 100%; display: grid; place-items: center; }
+    .hud {
+      position: fixed; left: 18px; bottom: 16px;
+      font: 12px/1.45 system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans KR", sans-serif;
+      color: rgba(0,0,0,.55); user-select: none; letter-spacing: .02em;
+    }
+    .hud b { color: rgba(0,0,0,.78); font-weight: 700; }
+    canvas { display: block; border-radius: 16px; }
+  </style>
+</head>
+<body>
+  <div class="wrap"></div>
+  <div class="hud">
+    <b>AFTERNOTE Field (B) + Dot Alphabet</b><br/>
+    SPACE: spray(랜덤) · 클릭/드래그: 강도(중심↑) · A–Z: 글자 · S: 저장 · R: 리셋
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+  <script>
+    /**
+     * ✅ 유지되는 기존 핵심 기능들
+     * 1) SPACE: “분사 이벤트” (spray 강도 랜덤)
+     * 2) 마우스 클릭/드래그: 분사 강도 직접 지정 (중심에 가까울수록 강)
+     * 3) 상태 흐름: PRESENCE(선명) → FADE(흐림) → AFTER(군집만 선명하게 고정)
+     * 4) 결과: 원형 Field(도트 기반) + 군집 강조
+     *
+     * ➕ 추가 기능
+     * - A–Z: 알파벳 글자를 “원(도트)”로 구성해 Field 안에 생성
+     * - 글자도 동일한 상태 흐름(PRESENCE/FADE/AFTER)으로 변화
+     */
+
+    // -------------------- State --------------------
+    let state = "AFTER";      // PRESENCE -> FADE -> AFTER (lock)
+    let lastEventMs = 0;
+
+    let field = null;
+    let glyph = null;         // dot-alphabet points
+    let currentLetter = "A";
+    let pg;                   // offscreen graphics for sampling
+
+    // -------------------- Config --------------------
+    const cfg = {
+      W: 980, H: 620,
+
+      // Field geometry (circle + slight distortion)
+      R: 225,
+      edgeJitter: 26,
+      noiseScale: 0.012,
+
+      // Field dots
+      minDots: 900,
+      maxDots: 2800,
+
+      // Timing (B mode)
+      presenceDuration: 650,
+      fadeDuration: 2100,
+
+      // Blur feel (simulated)
+      maxBlur: 12.0,
+
+      // Clusters (remembered islands)
+      clusterCountMin: 2,
+      clusterCountMax: 5,
+      clusterTightMin: 10,
+      clusterTightMax: 26,
+
+      // Dot alphabet (made of circles)
+      glyphSize: 280,
+      glyphStep: 6,            // 4~8 (낮을수록 촘촘)
+      glyphDotMin: 1.6,
+      glyphDotMax: 3.0,
+      glyphJitter: 1.4,
+      glyphInsideOnly: true,   // 글자 도트가 원형 Field 밖으로 안 나가게
+      afterGlyphKeep: 0.35     // AFTER에서 글자 잔여로 남기는 비율(0.2~0.5 추천)
+    };
+
+    function setup() {
+      const c = createCanvas(cfg.W, cfg.H);
+      c.parent(document.querySelector(".wrap"));
+      pixelDensity(2);
+      noStroke();
+
+      // offscreen buffer for glyph sampling
+      pg = createGraphics(520, 420);
+      pg.pixelDensity(1); // important for stable sampling
+
+      // initial
+      field = makeField(0.35);
+      glyph = makeGlyph(currentLetter, field.intensity);
+
+      state = "AFTER";
+      lastEventMs = millis();
+    }
+
+    function draw() {
+      background(210);
+
+      // ----------- B Mode state machine -----------
+      const dt = millis() - lastEventMs;
+
+      if (state === "PRESENCE") {
+        if (dt > cfg.presenceDuration) {
+          state = "FADE";
+          lastEventMs = millis();
+        }
+      } else if (state === "FADE") {
+        if (dt > cfg.fadeDuration) {
+          state = "AFTER"; // lock until next event
+        }
+      }
+
+      // ----------- Visual mapping by state -----------
+      let blurAmt = 0;
+      let baseAlpha = 255;
+      let clusterBoost = 0;
+
+      let glyphAlpha = 240;
+      let glyphSoft = 1.0; // 1 = sharp, bigger = softer
+
+      if (state === "PRESENCE") {
+        const u = easeOutCubic(normTime(dt, cfg.presenceDuration));
+        blurAmt = lerp(0.0, 1.6, u);
+        baseAlpha = 255;
+        clusterBoost = 0.15;
+
+        glyphAlpha = 240;
+        glyphSoft = 1.0; // crisp
+      } else if (state === "FADE") {
+        const u = easeInOutCubic(normTime(dt, cfg.fadeDuration));
+        blurAmt = lerp(1.6, cfg.maxBlur, u);
+        baseAlpha = floor(lerp(255, 90, u));
+        clusterBoost = lerp(0.25, 0.75, u);
+
+        glyphAlpha = floor(lerp(230, 85, u));
+        glyphSoft = lerp(1.2, 3.4, u); // softer
+      } else { // AFTER
+        blurAmt = cfg.maxBlur * 0.65;
+        baseAlpha = 95;
+        clusterBoost = 1.0;
+
+        glyphAlpha = 120;
+        glyphSoft = 1.8;
+      }
+
+      push();
+      translate(width / 2, height / 2);
+
+      // 1) 원형 Field (도트 기반)
+      renderFieldBase(field, blurAmt, baseAlpha);
+
+      // 2) 군집 강조 (AFTER에서 선명 고정)
+      renderClusters(field, state, clusterBoost);
+
+      // 3) 도트 알파벳 (원으로 글자 구성) — 기존 로직 위에 레이어로만 추가
+      renderGlyphDots(glyph, state, glyphAlpha, glyphSoft);
+
+      pop();
+
+      drawCornerCaption();
+    }
+
+    // -------------------- Interaction (kept) --------------------
+    function keyPressed() {
+      if (key === " ") {
+        // ✅ SPACE: 분사 이벤트(강도 랜덤)
+        triggerEvent(random(0.25, 1.0));
+      }
+      if (key === "s" || key === "S") {
+        saveCanvas(`AFTERNOTE_Field_${currentLetter}_${timestamp()}`, "png");
+      }
+      if (key === "r" || key === "R") {
+        field = makeField(0.35);
+        glyph = makeGlyph(currentLetter, field.intensity);
+        state = "AFTER";
+        lastEventMs = millis();
+      }
+
+      // ➕ A–Z: 글자 변경 (도트로 구성)
+      if (key.length === 1) {
+        const up = key.toUpperCase();
+        if (up >= "A" && up <= "Z") {
+          currentLetter = up;
+          glyph = makeGlyph(currentLetter, field.intensity);
+        }
+      }
+    }
+
+    function mousePressed() {
+      if (!insideCanvas()) return;
+      // ✅ 클릭: 강도 직접 지정
+      triggerEvent(mouseIntensity());
+    }
+
+    function mouseDragged() {
+      if (!insideCanvas()) return;
+      // ✅ 드래그: 연속적으로 강도 지정(조금 약하게)
+      triggerEvent(constrain(mouseIntensity() * 0.85, 0.12, 1.0));
+    }
+
+    function insideCanvas() {
+      return mouseX >= 0 && mouseX <= width && mouseY >= 0 && mouseY <= height;
+    }
+
+    function mouseIntensity() {
+      const cx = width / 2, cy = height / 2;
+      const d = dist(mouseX, mouseY, cx, cy);
+      const maxD = min(width, height) * 0.45;
+      // 중심에 가까울수록 강
+      return constrain(1.0 - (d / maxD), 0.12, 1.0);
+    }
+
+    function triggerEvent(intensity) {
+      // ✅ 기존 Field/Cluster 로직 그대로: 이벤트마다 새로운 필드 생성
+      field = makeField(intensity);
+      // ✅ 글자도 같은 “사건”으로 기록되게 동기화
+      glyph = makeGlyph(currentLetter, intensity);
+
+      // ✅ B 모드 상태 흐름 시작
+      state = "PRESENCE";
+      lastEventMs = millis();
+    }
+
+    // -------------------- Field generation (kept) --------------------
+    function makeField(intensity) {
+      const nDots = floor(lerp(cfg.minDots, cfg.maxDots, intensity));
+
+      // clusters
+      const k = floor(random(cfg.clusterCountMin, cfg.clusterCountMax + 1));
+      const clusters = [];
+      for (let i = 0; i < k; i++) {
+        const a = random(TWO_PI);
+        const rr = random(cfg.R * 0.15, cfg.R * 0.85);
+        clusters.push({
+          x: cos(a) * rr,
+          y: sin(a) * rr,
+          tight: random(cfg.clusterTightMin, cfg.clusterTightMax),
+          weight: random(0.8, 1.3)
+        });
+      }
+
+      // dots distribution: base + cluster dots
+      const dots = [];
+      const clusterShare = lerp(0.18, 0.42, intensity);
+      const nClusterDots = floor(nDots * clusterShare);
+      const nBaseDots = nDots - nClusterDots;
+
+      for (let i = 0; i < nBaseDots; i++) dots.push(sampleRadialPoint(intensity));
+
+      for (let i = 0; i < nClusterDots; i++) {
+        const c = random(clusters);
+        const x = c.x + randomGaussian(0, c.tight);
+        const y = c.y + randomGaussian(0, c.tight);
+        if (insideNoisyCircle(x, y, intensity)) dots.push({ x, y, s: random(1.0, 2.2) });
+      }
+
+      return { intensity, dots, clusters, id: makeFieldId(intensity) };
+    }
+
+    function sampleRadialPoint(intensity) {
+      const u = random();
+      const p = lerp(1.6, 3.0, intensity);
+      const rr = pow(u, p) * cfg.R;
+      const a = random(TWO_PI);
+      const x = cos(a) * rr;
+      const y = sin(a) * rr;
+      if (!insideNoisyCircle(x, y, intensity)) return sampleRadialPoint(intensity);
+      return { x, y, s: random(0.9, 2.1) };
+    }
+
+    function insideNoisyCircle(x, y, intensity) {
+      const a = atan2(y, x);
+      const r = sqrt(x*x + y*y);
+
+      const nx = cos(a) * 1000 + 999;
+      const ny = sin(a) * 1000 + 333;
+      const n = noise(nx * cfg.noiseScale, ny * cfg.noiseScale);
+
+      const jitter = cfg.edgeJitter * lerp(0.6, 1.0, intensity);
+      const edge = cfg.R + (n - 0.5) * 2.0 * jitter;
+
+      return r <= edge;
+    }
+
+    function makeFieldId(intensity) {
+      // record-like code (you can later map L/S/R/RN to actual After types)
+      const type = random(["L","S","R","RN"]);
+      const serial = nf(floor(map(intensity, 0.1, 1.0, 7, 99) + random(0, 40)), 3);
+      return `${type}-${serial}`;
+    }
+
+    // -------------------- Rendering (kept) --------------------
+    function renderFieldBase(field, blurAmt, alphaVal) {
+      // soft passes -> blur 느낌
+      const softPasses = 3;
+      for (let p = 0; p < softPasses; p++) {
+        const k = (p + 1) / softPasses;
+        const a = alphaVal * (0.18 / k);
+        fill(60, a);
+        for (const d of field.dots) {
+          const s = d.s + blurAmt * (1.2 + k * 1.8);
+          circle(d.x, d.y, s);
+        }
+      }
+
+      // base dots
+      fill(60, alphaVal);
+      const sharpScale = lerp(1.0, 1.9, blurAmt / cfg.maxBlur);
+      for (const d of field.dots) circle(d.x, d.y, d.s * sharpScale);
+    }
+
+    function renderClusters(field, state, boost) {
+      const isAfter = state === "AFTER";
+      const crispAlpha = isAfter ? 210 : floor(110 * boost);
+      const ringAlpha = isAfter ? 80 : floor(35 * boost);
+
+      for (const c of field.clusters) {
+        // halo
+        fill(60, ringAlpha);
+        circle(c.x, c.y, lerp(44, 70, boost));
+
+        // crisp cores
+        fill(40, crispAlpha);
+        const n = floor(lerp(120, 260, boost) * c.weight);
+        for (let i = 0; i < n; i++) {
+          const x = c.x + randomGaussian(0, c.tight * 0.55);
+          const y = c.y + randomGaussian(0, c.tight * 0.55);
+          if (insideNoisyCircle(x, y, field.intensity)) circle(x, y, random(1.2, 2.6));
+        }
+      }
+    }
+
+    // -------------------- Dot Alphabet (added, but non-destructive) --------------------
+    function makeGlyph(letter, intensity) {
+      // draw letter on offscreen, sample pixels, convert to dot points
+      pg.clear();
+      pg.background(0, 0);
+      pg.fill(0);
+      pg.noStroke();
+      pg.textAlign(CENTER, CENTER);
+      pg.textSize(cfg.glyphSize);
+      pg.textStyle(BOLD);
+      pg.text(letter, pg.width/2, pg.height/2 + cfg.glyphSize*0.06);
+
+      pg.loadPixels();
+      const pts = [];
+      const sx = pg.width, sy = pg.height;
+      const step = cfg.glyphStep;
+      const scale = 0.78;
+
+      for (let y = 0; y < sy; y += step) {
+        for (let x = 0; x < sx; x += step) {
+          const idx = 4 * (y * sx + x);
+          const a = pg.pixels[idx + 3];
+          if (a > 10) {
+            let px = (x - sx/2) * scale + randomGaussian(0, cfg.glyphJitter);
+            let py = (y - sy/2) * scale + randomGaussian(0, cfg.glyphJitter);
+
+            if (!cfg.glyphInsideOnly || insideNoisyCircle(px, py, intensity)) {
+              pts.push({ x: px, y: py, s: random(cfg.glyphDotMin, cfg.glyphDotMax), a });
+            }
+          }
+        }
+      }
+
+      // intensity에 따라 글자 밀도 변화(강할수록 더 많은 도트)
+      shuffle(pts, true);
+      const keep = floor(map(intensity, 0.12, 1.0, pts.length * 0.55, pts.length));
+      pts.length = max(200, keep);
+
+      return { letter, points: pts };
+    }
+
+    function renderGlyphDots(glyph, state, alphaVal, softness) {
+      if (!glyph) return;
+
+      // AFTER: “전체가 또렷”이 아니라 “남을 것만 남음”
+      let pts = glyph.points;
+      if (state === "AFTER") {
+        const keepN = floor(pts.length * cfg.afterGlyphKeep);
+        pts = pts.slice(0, keepN);
+      }
+
+      // softness를 점 크기 + 다중 패스로 처리 (텍스트가 아니라 도트로만 표현)
+      const passes = (state === "PRESENCE") ? 1 : 2;
+      for (let p = 0; p < passes; p++) {
+        const a = alphaVal * (p === 0 ? 1.0 : 0.22);
+        fill(30, a);
+        for (const d of pts) {
+          const s = d.s * (1.0 + (softness - 1.0) * 0.7) + (p * softness * 0.6);
+          circle(d.x, d.y, s);
+        }
+      }
+    }
+
+    // -------------------- Caption --------------------
+    function drawCornerCaption() {
+      push();
+      fill(0, 85);
+      textAlign(LEFT, TOP);
+      textSize(12);
+      const label = `AFTERNOTE 01 — ${currentLetter} AFTER   FIELD ${field?.id ?? ""}   STATE ${state}`;
+      text(label, 16, 16);
+      pop();
+    }
+
+    // -------------------- Utils --------------------
+    function normTime(t, d) { return d <= 0 ? 1 : constrain(t / d, 0, 1); }
+    function easeOutCubic(x) { return 1 - pow(1 - x, 3); }
+    function easeInOutCubic(x) {
+      return x < 0.5 ? 4*x*x*x : 1 - pow(-2*x + 2, 3)/2;
+    }
+    function timestamp() {
+      const d = new Date();
+      const pad = n => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    }
+  </script>
+</body>
+</html>
